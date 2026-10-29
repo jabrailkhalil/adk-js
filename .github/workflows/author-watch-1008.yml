@@ -1,0 +1,74 @@
+name: Independent real-watch lifetime verification
+on:
+  push:
+    branches: [validation/watch-1008-20261029]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - source: original-report
+            repo: jabrailkhalil/adk-js
+            sha: 9787563c0e42274d5cb30aa18b65c92553f843dc
+          - source: maintainer-fix
+            repo: google/adk-js
+            sha: 75a1c4f56e222b623361ca468c50b8c55a49da8a
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repo }}
+          ref: ${{ matrix.sha }}
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+      - name: Pin and prepare the unchanged probe
+        working-directory: source
+        env:
+          EXPECTED: ${{ matrix.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED"
+          mkdir -p /tmp/adk-watch-results
+          git log -1 --format=fuller > /tmp/adk-watch-results/source.txt
+          node --version >> /tmp/adk-watch-results/source.txt
+          cp ../harness/scripts/validation/watch_lifetime_probe_test.ts tests/integration/app_loader/real_watch_lifetime_probe_test.ts
+          sha256sum tests/integration/app_loader/real_watch_lifetime_probe_test.ts >> /tmp/adk-watch-results/source.txt
+      - name: Install exact source dependencies
+        working-directory: source
+        run: npm ci --ignore-scripts
+      - name: Build the real fixture dependency
+        working-directory: source
+        run: npm run build --workspace=@google/adk
+      - name: Real HTTP and filesystem-watch comparison
+        working-directory: source
+        env:
+          ADK_WATCH_OBSERVATIONS: /tmp/adk-watch-results/observations.jsonl
+          SOURCE: ${{ matrix.source }}
+        run: |
+          set +e
+          npx vitest run --project integration tests/integration/app_loader/real_watch_lifetime_probe_test.ts --maxWorkers=1 --reporter=default --reporter=json --outputFile=/tmp/adk-watch-results/tests.json > /tmp/adk-watch-results/tests.log 2>&1
+          result=$?
+          set -e
+          cat /tmp/adk-watch-results/tests.log
+          printf '%s\n' "$result" > /tmp/adk-watch-results/exit-code.txt
+          node -e 'const f=require("node:fs");const r=JSON.parse(f.readFileSync("/tmp/adk-watch-results/tests.json"));const a=r.testResults.flatMap(t=>t.assertionResults);if(process.env.SOURCE==="maintainer-fix"){if(a.length!==4||a.some(t=>t.status!=="passed"))process.exit(1);}else{const good=a.filter(t=>t.status==="passed");const bad=a.filter(t=>t.status==="failed");if(good.length!==2||bad.length!==2||bad.some(t=>!t.title.includes("change")||!t.failureMessages.join("\n").includes("active request retains its compiled bundle")))process.exit(1);}'
+      - name: Tracked source remains clean
+        working-directory: source
+        run: git diff --exit-code HEAD -- .
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: real-watch-${{ matrix.source }}
+          path: /tmp/adk-watch-results
